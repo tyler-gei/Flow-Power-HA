@@ -136,10 +136,12 @@ class FlowPowerBaseSensor(CoordinatorEntity[FlowPowerCoordinator], SensorEntity)
         try:
             tz_name = REGION_TIMEZONES.get(self._region, "Australia/Sydney")
             tz = ZoneInfo(tz_name)
+            nem_tz = ZoneInfo("Australia/Brisbane")
 
             if "/" in timestamp:
-                dt = datetime.strptime(timestamp, "%Y/%m/%d %H:%M:%S")
-                dt = dt.replace(tzinfo=tz)
+                dt_native = datetime.strptime(timestamp, "%Y/%m/%d %H:%M:%S")
+                dt_aest = dt_native.replace(tzinfo=nem_tz)
+                dt = dt_aest.astimezone(tz)
             else:
                 return timestamp
 
@@ -155,10 +157,12 @@ class FlowPowerBaseSensor(CoordinatorEntity[FlowPowerCoordinator], SensorEntity)
         try:
             tz_name = REGION_TIMEZONES.get(self._region, "Australia/Sydney")
             tz = ZoneInfo(tz_name)
+            nem_tz = ZoneInfo("Australia/Brisbane")
 
             if "/" in timestamp:
-                dt = datetime.strptime(timestamp, "%Y/%m/%d %H:%M:%S")
-                return dt.replace(tzinfo=tz)
+                dt_native = datetime.strptime(timestamp, "%Y/%m/%d %H:%M:%S")
+                dt_aest = dt_native.replace(tzinfo=nem_tz)
+                return dt_aest.astimezone(tz)
             return None
         except (ValueError, TypeError):
             return None
