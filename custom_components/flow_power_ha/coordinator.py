@@ -167,7 +167,7 @@ class FlowPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.hass,
                 self._handle_tariff_refresh,
                 minute=[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55],
-                second=[0],
+                second=[0, 5, 10, 30],
             )
             self._unsub_time_listeners.append(unsub_tariff)
 
