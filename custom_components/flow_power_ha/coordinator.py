@@ -26,7 +26,7 @@ from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api_clients import AEMOClient, FlowPowerPortalClient
+from .api_clients import AEMOClient, FlowPowerPortalClient, REGION_TIMEZONES
 from .const import (
     CONF_BASE_RATE,
     CONF_FLOWPOWER_EMAIL,
@@ -308,7 +308,7 @@ class FlowPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                 # Brisbane is NEM Time
                 # Use Local TZ as tariff data is localised
-                region_tz = ZoneInfo(REGION_TIMEZONE_MAP.get(self.region, "Australia/Brisbane"))
+                region_tz = ZoneInfo(REGION_TIMEZONES.get(self.region, "Australia/Brisbane"))
                 base_date = datetime.now(region_tz).replace(
                     hour=0, minute=0, second=0, microsecond=0,
                 )
