@@ -306,8 +306,10 @@ class FlowPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 schedule: dict[int, float] = {}
                 from zoneinfo import ZoneInfo
 
-                aest = ZoneInfo("Australia/Sydney")
-                base_date = datetime.now(aest).replace(
+                # Brisbane is NEM Time
+                # Use Local TZ as tariff data is localised
+                region_tz = ZoneInfo(REGION_TIMEZONE_MAP.get(self.region, "Australia/Brisbane"))
+                base_date = datetime.now(region_tz).replace(
                     hour=0, minute=0, second=0, microsecond=0,
                 )
                 for slot in range(48):
