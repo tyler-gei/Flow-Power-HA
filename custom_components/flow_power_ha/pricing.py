@@ -1,7 +1,7 @@
 """Flow Power pricing calculations including PEA and export rates."""
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -219,6 +219,7 @@ def calculate_forecast_prices(
     twap: float | None = None,
     tariff_schedule: dict[int, float] | None = None,
     avg_daily_tariff: float | None = None,
+    region_tz: str = "Australia/Brisbane",  
 ) -> list[dict[str, Any]]:
     """Calculate import prices for a forecast array.
 
@@ -263,8 +264,18 @@ def calculate_forecast_prices(
                     # Also handle ISO format: "2026-04-01T13:30:00"
                     ts = timestamp_str.replace("/", "-")
                     dt = datetime.fromisoformat(ts)
-                    # Half-hour slot: 0-47 (hour * 2 + minute // 30)
-                    slot_index = dt.hour * 2 + dt.minute // 30
+                    if dt.tzinfo is None:
+                        # Naive AEMO timestamps are in NEM time (AEST = UTC+10).
+                        # Convert to local region time for correct half-hour slot lookup.
+                        dt = dt.replace(tzinfo=ZoneInfo("Australia/Brisbane")).astimezone(
+                            ZoneInfo(region_tz)
+                        )
+                    else:
+                        dt = dt.astimezone(ZoneInfo(region_tz))
+                    # AEMO timestamps are end-of-period; subtract 1 min so that
+                    # boundary times (:00, :30) map to the correct preceding slot.
+                    dt_start = dt - timedelta(minutes=1)
+                    slot_index = dt_start.hour * 2 + dt_start.minute // 30
                     network_tariff_rate = tariff_schedule.get(slot_index)
                 except (ValueError, TypeError):
                     pass

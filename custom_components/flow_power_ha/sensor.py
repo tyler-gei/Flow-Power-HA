@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -122,13 +122,14 @@ class FlowPowerBaseSensor(CoordinatorEntity[FlowPowerCoordinator], SensorEntity)
         }
 
     def _convert_to_iso_timestamp(self, timestamp: str) -> str:
-        """Convert AEMO timestamp format to ISO format with timezone.
+        """Convert any timestamp to a consistent local-timezone ISO string.
 
-        Args:
-            timestamp: AEMO format '2025/12/22 09:30:00' or ISO format
+        Accepts:
+          - AEMO NEM format:  '2025/12/22 09:30:00'  (always AEST = UTC+10)
+          - ISO format:       '2025-12-22T09:30:00+09:30'  (dispatch entries)
 
-        Returns:
-            ISO format '2025-12-22 09:30:00+10:00'
+        Returns '2025-12-22 09:30:00+1000' — space separator, no colon in
+        UTC offset — so YAML never quotes the key with single-quotes.
         """
         if not timestamp:
             return ""
@@ -136,32 +137,58 @@ class FlowPowerBaseSensor(CoordinatorEntity[FlowPowerCoordinator], SensorEntity)
         try:
             tz_name = REGION_TIMEZONES.get(self._region, "Australia/Sydney")
             tz = ZoneInfo(tz_name)
+            nem_tz = ZoneInfo("Australia/Brisbane")
 
             if "/" in timestamp:
-                dt = datetime.strptime(timestamp, "%Y/%m/%d %H:%M:%S")
-                dt = dt.replace(tzinfo=tz)
+                dt_native = datetime.strptime(timestamp, "%Y/%m/%d %H:%M:%S")
+                dt = dt_native.replace(tzinfo=nem_tz).astimezone(tz)
             else:
-                return timestamp
+                # ISO timestamp from dispatch entry — already has tz info
+                dt = datetime.fromisoformat(timestamp).astimezone(tz)
 
             return dt.strftime("%Y-%m-%d %H:%M:%S%z")
         except (ValueError, TypeError):
             return timestamp
 
     def _parse_timestamp_to_datetime(self, timestamp: str) -> datetime | None:
-        """Parse timestamp string to datetime with timezone."""
+        """Parse any timestamp string to a timezone-aware datetime."""
         if not timestamp:
             return None
 
         try:
             tz_name = REGION_TIMEZONES.get(self._region, "Australia/Sydney")
             tz = ZoneInfo(tz_name)
+            nem_tz = ZoneInfo("Australia/Brisbane")
 
             if "/" in timestamp:
-                dt = datetime.strptime(timestamp, "%Y/%m/%d %H:%M:%S")
-                return dt.replace(tzinfo=tz)
-            return None
+                dt_native = datetime.strptime(timestamp, "%Y/%m/%d %H:%M:%S")
+                return dt_native.replace(tzinfo=nem_tz).astimezone(tz)
+
+            # ISO timestamp (dispatch entry)
+            return datetime.fromisoformat(timestamp).astimezone(tz)
         except (ValueError, TypeError):
             return None
+
+    def _get_start_of_period_dt(self, period: dict) -> datetime | None:
+        """Return start-of-period datetime for a forecast period.
+
+        Dispatch entries already carry a start-of-period timestamp.
+        Predispatch (30 min) and P5 (5 min) entries carry end-of-period
+        NEM timestamps; subtract period_minutes to get the period start.
+        """
+        dt = self._parse_timestamp_to_datetime(period.get("timestamp", ""))
+        if dt is None:
+            return None
+        if not period.get("is_dispatch"):
+            dt = dt - timedelta(minutes=period.get("period_minutes", 30))
+        return dt
+
+    def _get_start_of_period_timestamp(self, period: dict) -> str:
+        """Return an ISO display timestamp anchored at the start of the period."""
+        dt = self._get_start_of_period_dt(period)
+        if dt is None:
+            return self._convert_to_iso_timestamp(period.get("timestamp", ""))
+        return dt.strftime("%Y-%m-%d %H:%M:%S%z")
 
 
 class FlowPowerImportPriceSensor(FlowPowerBaseSensor):
@@ -213,8 +240,7 @@ class FlowPowerImportPriceSensor(FlowPowerBaseSensor):
         if self.coordinator.data and self.coordinator.data.get("forecast"):
             forecast_dict = {}
             for period in self.coordinator.data["forecast"]:
-                raw_ts = period.get("timestamp", "")
-                iso_ts = self._convert_to_iso_timestamp(raw_ts)
+                iso_ts = self._get_start_of_period_timestamp(period)
                 if iso_ts:
                     forecast_dict[iso_ts] = period.get("price_dollars", 0)
             attrs["forecast_dict"] = forecast_dict
@@ -287,9 +313,8 @@ class FlowPowerExportPriceSensor(FlowPowerBaseSensor):
         if self.coordinator.data and self.coordinator.data.get("forecast"):
             forecast_dict = {}
             for period in self.coordinator.data["forecast"]:
-                raw_ts = period.get("timestamp", "")
-                iso_ts = self._convert_to_iso_timestamp(raw_ts)
-                dt = self._parse_timestamp_to_datetime(raw_ts)
+                iso_ts = self._get_start_of_period_timestamp(period)
+                dt = self._get_start_of_period_dt(period)
                 if iso_ts and dt:
                     export_price = self._get_export_price_for_time(dt)
                     forecast_dict[iso_ts] = export_price
@@ -341,10 +366,8 @@ class FlowPowerWholesaleSensor(FlowPowerBaseSensor):
         if self.coordinator.data and self.coordinator.data.get("forecast"):
             forecast_dict = {}
             for period in self.coordinator.data["forecast"]:
-                raw_ts = period.get("timestamp", "")
-                iso_ts = self._convert_to_iso_timestamp(raw_ts)
+                iso_ts = self._get_start_of_period_timestamp(period)
                 if iso_ts:
-                    # Convert c/kWh to $/kWh
                     wholesale_cents = period.get("wholesale_cents", 0)
                     forecast_dict[iso_ts] = round(wholesale_cents / 100, 4)
             attrs["forecast_dict"] = forecast_dict
@@ -414,8 +437,7 @@ class FlowPowerForecastSensor(FlowPowerBaseSensor):
 
             for period in forecast:
                 price = period.get("price_dollars", 0)
-                raw_ts = period.get("timestamp", "")
-                iso_ts = self._convert_to_iso_timestamp(raw_ts)
+                iso_ts = self._get_start_of_period_timestamp(period)
 
                 prices.append(price)
                 timestamps.append(iso_ts)
@@ -437,8 +459,7 @@ class FlowPowerForecastSensor(FlowPowerBaseSensor):
             apex_import = []
             apex_wholesale = []
             for period in forecast:
-                raw_ts = period.get("timestamp", "")
-                dt = self._parse_timestamp_to_datetime(raw_ts)
+                dt = self._get_start_of_period_dt(period)
                 if dt:
                     epoch_ms = int(dt.timestamp() * 1000)
                     apex_import.append(

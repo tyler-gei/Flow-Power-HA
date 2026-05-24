@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import time as time_mod
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 import aiohttp
@@ -26,7 +27,7 @@ from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api_clients import AEMOClient, FlowPowerPortalClient
+from .api_clients import AEMOClient, FlowPowerPortalClient, REGION_TIMEZONES
 from .const import (
     CONF_BASE_RATE,
     CONF_FLOWPOWER_EMAIL,
@@ -167,7 +168,7 @@ class FlowPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.hass,
                 self._handle_tariff_refresh,
                 minute=[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55],
-                second=[0],
+                second=[0, 5, 10, 30],
             )
             self._unsub_time_listeners.append(unsub_tariff)
 
@@ -232,6 +233,33 @@ class FlowPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if next_min >= 60:
             return now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         return now.replace(minute=next_min, second=0, microsecond=0)
+
+    def _prune_stale_forecast(self, forecast: list[dict]) -> list[dict]:
+        """Remove forecast periods whose end-time is more than 5 min in the past.
+
+        Dispatch entries (is_dispatch=True) are always kept because their
+        timestamp represents the *start* of the current period, not the end.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+        aest = ZoneInfo("Australia/Brisbane")
+        pruned = []
+        for p in forecast:
+            if p.get("is_dispatch"):
+                pruned.append(p)
+                continue
+            ts = p.get("timestamp", "")
+            if not ts:
+                continue
+            try:
+                if "/" in ts:
+                    dt = datetime.strptime(ts, "%Y/%m/%d %H:%M:%S").replace(tzinfo=aest)
+                else:
+                    dt = datetime.fromisoformat(ts)
+                if dt.astimezone(timezone.utc) >= cutoff:
+                    pruned.append(p)
+            except (ValueError, TypeError):
+                pruned.append(p)
+        return pruned
 
     def _adjust_poll_interval(self) -> bool:
         """Set update_interval based on proximity to the next dispatch boundary.
@@ -306,8 +334,10 @@ class FlowPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 schedule: dict[int, float] = {}
                 from zoneinfo import ZoneInfo
 
-                aest = ZoneInfo("Australia/Sydney")
-                base_date = datetime.now(aest).replace(
+                # Brisbane is NEM Time
+                # Use Local TZ as tariff data is localised
+                region_tz = ZoneInfo(REGION_TIMEZONES.get(self.region, "Australia/Brisbane"))
+                base_date = datetime.now(region_tz).replace(
                     hour=0, minute=0, second=0, microsecond=0,
                 )
                 for slot in range(48):
@@ -495,6 +525,7 @@ class FlowPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not should_fetch:
                 # Export price is time-based — keep it current even in WAIT mode.
                 data["export_price"] = calculate_export_price(self.region)
+                data["forecast"] = self._prune_stale_forecast(data.get("forecast", []))
                 return data
 
             # Fetch current prices based on source
@@ -577,8 +608,89 @@ class FlowPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             twap=twap_for_forecast,
                             tariff_schedule=self._tariff_schedule,
                             avg_daily_tariff=self._avg_daily_tariff,
+                            region_tz=REGION_TIMEZONES.get(self.region, "Australia/Brisbane"),
                         )
+                        for _entry in data["forecast"]:
+                            _entry["period_minutes"] = 30
                         _LOGGER.info("Calculated forecast periods: %d", len(data["forecast"]))
+
+                    # After data["forecast"] is built from 30-min predispatch...
+
+                    # Fetch 5-minute P5 data and prepend to forecast
+                    p5_raw, is_new_p5, _ = await self._aemo_client.get_p5_forecast_with_file(self.region)
+                    _LOGGER.info(
+                        "Flow Power: P5 fetch — periods=%d, new_file=%s",
+                        len(p5_raw) if p5_raw else 0,
+                        is_new_p5,
+                    )
+                    if p5_raw:
+                        p5_priced = calculate_forecast_prices(
+                            p5_raw,
+                            base_rate=self.base_rate,
+                            pea_enabled=self.pea_enabled,
+                            pea_custom_value=self.pea_custom_value,
+                            twap=twap_for_forecast,
+                            tariff_schedule=self._tariff_schedule,
+                            avg_daily_tariff=self._avg_daily_tariff,
+                            region_tz=REGION_TIMEZONES.get(self.region, "Australia/Brisbane"),
+                        )
+                        for _entry in p5_priced:
+                            _entry["period_minutes"] = 5
+                        # P5 covers the next ~1 hour in 5-min slots — prepend to the 30-min forecast,
+                        # dropping any 30-min periods already covered by the P5 window
+                        if p5_priced and data.get("forecast"):
+                            p5_end_ts = p5_priced[-1]["timestamp"]
+                            data["forecast"] = p5_priced + [
+                                p for p in data["forecast"]
+                                if p["timestamp"] > p5_end_ts
+                            ]
+                        elif p5_priced:
+                            data["forecast"] = p5_priced
+
+                    # Splice real-time dispatch price into the first forecast period,
+                    # replacing the stale predispatch estimate for the current interval
+                    now_dt = datetime.now(ZoneInfo(REGION_TIMEZONES.get(self.region, "Australia/Brisbane")))
+                    # Round down to current 5-minute boundary
+                    current_5min = now_dt.replace(
+                        minute=(now_dt.minute // 5) * 5,
+                        second=0,
+                        microsecond=0,
+                    )
+                    dispatch_entry = {
+                        "timestamp": current_5min.isoformat(),
+                        "price_dollars": import_info.get("final_dollars"),
+                        "price_cents": import_info.get("final_cents"),
+                        "wholesale_cents": wholesale_cents,
+                        "pea": import_info.get("pea"),
+                        "network_tariff_rate": self._network_tariff_rate,
+                        "is_dispatch": True,  # flag so consumers can distinguish it
+                    }
+
+                    # Drop any forecast period that overlaps with or predates the
+                    # current dispatch window (current_5min .. current_5min+5min).
+                    # A period overlaps if its START < current_5min + 5min.
+                    # period_start = raw_end_of_period(AEST) - period_minutes.
+                    _aest = ZoneInfo("Australia/Brisbane")
+                    _boundary = current_5min.astimezone(_aest)
+                    _dispatch_end = _boundary + timedelta(minutes=5)
+                    _cleaned: list[dict] = []
+                    for _p in data.get("forecast", []):
+                        if _p.get("is_dispatch"):
+                            continue  # old dispatch entries are replaced below
+                        _ts = _p.get("timestamp", "")
+                        if not _ts or "/" not in _ts:
+                            _cleaned.append(_p)
+                            continue
+                        try:
+                            _end = datetime.strptime(_ts, "%Y/%m/%d %H:%M:%S").replace(
+                                tzinfo=_aest
+                            )
+                            _start = _end - timedelta(minutes=_p.get("period_minutes", 30))
+                            if _start >= _dispatch_end:
+                                _cleaned.append(_p)
+                        except (ValueError, TypeError):
+                            _cleaned.append(_p)
+                    data["forecast"] = [dispatch_entry] + _cleaned
 
                 elif not is_new_dispatch and self._next_boundary is None and region_data:
                     # First run — file already cached but we still need a boundary.
@@ -612,6 +724,7 @@ class FlowPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # Export price is always recalculated (time-based)
             data["export_price"] = calculate_export_price(self.region)
+            data["forecast"] = self._prune_stale_forecast(data.get("forecast", []))
 
             return data
 

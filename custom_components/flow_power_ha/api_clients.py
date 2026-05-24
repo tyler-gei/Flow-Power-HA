@@ -25,6 +25,7 @@ from .const import (
     FLOWPOWER_B2C_POLICY,
     FLOWPOWER_B2C_TENANT,
     NEM_REGIONS,
+    AEMO_P5_BASE_URL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,6 +54,8 @@ class AEMOClient:
         self._last_dispatch_file: str | None = None
         self._dispatch_cache: dict[str, Any] = {}  # filename → parsed prices
         self._last_predispatch_file: str | None = None
+        self._last_p5_file: str | None = None       
+        self._p5_cache: dict[str, Any] = {}          
 
     async def get_current_prices(self) -> dict[str, dict[str, Any]]:
         """Fetch current 5-minute dispatch prices for all NEM regions.
@@ -417,6 +420,148 @@ class AEMOClient:
 
         except Exception as e:
             _LOGGER.error("Error parsing pre-dispatch ZIP: %s", e)
+            return []
+
+    async def get_p5_forecast_with_file(
+        self, region: str
+    ) -> tuple[list[dict[str, Any]], bool, str]:
+        """Fetch 5-minute predispatch (P5) forecast from NEMWEB."""
+        try:
+            async with self._session.get(
+                AEMO_P5_BASE_URL,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                status = response.status
+                html = await response.text()
+
+            if status != 200:
+                _LOGGER.warning(
+                    "P5: directory listing returned HTTP %d (url=%s, html_len=%d)",
+                    status, AEMO_P5_BASE_URL, len(html),
+                )
+                return [], False, ""
+
+            pattern = r'PUBLIC_P5MIN_\d{12}_\d+[^\">\s]*\.zip'
+            matches = re.findall(pattern, html)
+            _LOGGER.info(
+                "P5: directory listing ok (html_len=%d), found %d file(s)",
+                len(html), len(matches),
+            )
+            if not matches:
+                _LOGGER.warning(
+                    "P5: no PUBLIC_P5MIN_*.zip files found — listing snippet: %s",
+                    html[:400],
+                )
+                return [], False, ""
+
+            latest_file = sorted(matches)[-1]
+            is_new_file = latest_file != self._last_p5_file
+            if not is_new_file and self._p5_cache.get(region):
+                return self._p5_cache[region], False, latest_file
+
+            file_url = f"{AEMO_P5_BASE_URL}{latest_file}"
+            async with self._session.get(
+                file_url, timeout=aiohttp.ClientTimeout(total=60)
+            ) as response:
+                if response.status != 200:
+                    _LOGGER.warning("P5: file download returned HTTP %d (%s)", response.status, file_url)
+                    return [], False, ""
+                content = await response.read()
+
+            _LOGGER.info("P5: downloaded %s (%d bytes)", latest_file, len(content))
+            self._last_p5_file = latest_file
+            forecasts = self._parse_p5_zip(content, region)
+            _LOGGER.info("P5: parsed %d periods for %s from %s", len(forecasts), region, latest_file)
+            self._p5_cache[region] = forecasts
+            return forecasts, True, latest_file
+
+        except Exception as e:
+            _LOGGER.error("Error fetching P5 report: %s", e)
+            return [], False, ""
+
+    def _parse_p5_zip(self, content: bytes, region: str) -> list[dict[str, Any]]:
+        """Parse P5 5-minute predispatch ZIP file.
+
+        CSV format: D,P5MIN,REGIONSOLUTION,10,RUN_DATETIME,INTERVENTION,INTERVAL_DATETIME,REGIONID,RRP
+        Timestamp format: YYYY/MM/DD HH:MM:SS
+        """
+        forecasts = []
+        first_regionsolution_row: list[str] | None = None
+        n_regionsolution = 0
+        n_intervention_filtered = 0
+        n_region_filtered = 0
+        n_parse_errors = 0
+        regions_seen: set[str] = set()
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                csv_files = [f for f in zf.namelist() if f.upper().endswith('.CSV')]
+                _LOGGER.info("P5: ZIP contains %d CSV file(s): %s", len(csv_files), csv_files)
+                for filename in csv_files:
+                    with zf.open(filename) as f:
+                        reader = csv.reader(io.StringIO(f.read().decode("utf-8-sig")))
+                        for row in reader:
+                            if len(row) < 9:
+                                continue
+                            if row[0] == "D" and row[1] == "P5MIN" and row[2] == "REGIONSOLUTION":
+                                n_regionsolution += 1
+                                if first_regionsolution_row is None:
+                                    first_regionsolution_row = row
+                                try:
+                                    intervention = int(row[5]) if row[5].strip() else 0
+                                except (ValueError, IndexError):
+                                    intervention = 0
+                                if intervention != 0:
+                                    n_intervention_filtered += 1
+                                    continue
+                                row_region = row[7].strip()
+                                regions_seen.add(row_region)
+                                if row_region != region:
+                                    n_region_filtered += 1
+                                    continue
+                                try:
+                                    raw_ts = row[6].strip('"').strip()
+                                    dt = datetime.strptime(raw_ts, "%Y/%m/%d %H:%M:%S")
+                                    timestamp = dt.strftime("%Y/%m/%d %H:%M:%S")
+                                    rrp = float(row[8])
+                                    forecasts.append({
+                                        "nemTime": timestamp,
+                                        "perKwh": rrp / 10,
+                                        "wholesaleKWHPrice": rrp / 1000,
+                                        "price_mwh": rrp,
+                                    })
+                                except (ValueError, IndexError) as parse_err:
+                                    n_parse_errors += 1
+                                    _LOGGER.debug(
+                                        "P5: parse error on row %s: %s", row[:9], parse_err
+                                    )
+                                    continue
+
+            if first_regionsolution_row is not None:
+                _LOGGER.info(
+                    "P5: REGIONSOLUTION rows=%d, intervention_filtered=%d, "
+                    "region_filtered=%d, parse_errors=%d, regions_in_file=%s, "
+                    "first_row(0-8)=%s",
+                    n_regionsolution, n_intervention_filtered,
+                    n_region_filtered, n_parse_errors,
+                    sorted(regions_seen),
+                    first_regionsolution_row[:9],
+                )
+            else:
+                _LOGGER.warning("P5: no REGIONSOLUTION rows found in ZIP")
+
+            seen: set[str] = set()
+            unique = []
+            for f in sorted(forecasts, key=lambda x: x["nemTime"]):
+                if f["nemTime"] not in seen:
+                    seen.add(f["nemTime"])
+                    unique.append(f)
+
+            _LOGGER.info("P5 ZIP parsed %d periods for %s", len(unique), region)
+            return unique
+
+        except Exception as e:
+            _LOGGER.error("Error parsing P5 ZIP: %s", e)
             return []
 
 

@@ -48,7 +48,7 @@ def get_network_tariff_rate(
     """
     try:
         from aemo_to_tariff import spot_to_tariff
-        # The NEM Interval Time is the end of the 5 min window, hence +5 on interval_time
+
         with _suppress_stdout():
             rate = spot_to_tariff(
                 interval_time=dt + timedelta(minutes=5),
@@ -88,7 +88,7 @@ def compute_avg_daily_tariff(
     try:
         from aemo_to_tariff import spot_to_tariff
 
-        now = datetime.now(tz=timezone(timedelta(hours=10)))  # AEST
+        now = datetime.now(tz=timezone(timedelta(hours=9.5)))  # AEST
         base_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
         total = 0.0
@@ -97,7 +97,7 @@ def compute_avg_daily_tariff(
             slot_time = base_date + timedelta(minutes=slot * 30)
             with _suppress_stdout():
                 rate = spot_to_tariff(
-                    interval_time=slot_time,
+                    interval_time=slot_time + timedelta(minutes=5),
                     network=network,
                     tariff=tariff_code,
                     rrp=0,

@@ -162,6 +162,7 @@ AEMO_PREDISPATCH_PRICES_URL = "https://visualisations.aemo.com.au/aemo/apps/api/
 # NEMWEB ZIP endpoints (faster - raw source data)
 AEMO_DISPATCH_URL = "https://nemweb.com.au/Reports/Current/DispatchIS_Reports/"
 AEMO_FORECAST_BASE_URL = "https://nemweb.com.au/Reports/Current/Predispatch_Reports/"
+AEMO_P5_BASE_URL = "https://nemweb.com.au/Reports/Current/P5_Reports/"
 
 # Flow Power Portal API URLs
 FLOWPOWER_BASE_URL = "https://flowpower.kwatch.com.au"
