@@ -11,7 +11,7 @@ import io
 import logging
 import sys
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -71,6 +71,7 @@ def get_network_tariff_rate(
 def compute_avg_daily_tariff(
     network: str,
     tariff_code: str,
+    region_tz: str = "Australia/Brisbane",
 ) -> float | None:
     """Compute the 24-hour average of the network tariff rate.
 
@@ -81,14 +82,16 @@ def compute_avg_daily_tariff(
     Args:
         network: aemo_to_tariff network parameter.
         tariff_code: Tariff code.
+        region_tz: IANA timezone string for the region (e.g. "Australia/Adelaide").
 
     Returns:
         Average daily tariff in c/kWh, or None on error.
     """
     try:
         from aemo_to_tariff import spot_to_tariff
+        from zoneinfo import ZoneInfo
 
-        now = datetime.now(tz=timezone(timedelta(hours=9.5)))  # AEST
+        now = datetime.now(tz=ZoneInfo(region_tz))
         base_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
         total = 0.0

@@ -323,6 +323,7 @@ class FlowPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if api_name:
                 self._avg_daily_tariff = await self.hass.async_add_executor_job(
                     compute_avg_daily_tariff, api_name, self._fp_tariff_code,
+                    REGION_TIMEZONES.get(self.region, "Australia/Brisbane"),
                 )
                 self._network_tariff_rate = await self.hass.async_add_executor_job(
                     get_network_tariff_rate,
